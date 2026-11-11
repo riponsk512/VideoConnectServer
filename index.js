@@ -1,4 +1,4 @@
-// index.js (Root of VideoConnectServer GitHub repository)
+// VideoConnectServer/index.js
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
@@ -23,11 +23,11 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 5000;
-const QUEUE_MAX_WAIT_MS = 10000; // 10s max wait in matchmaking queue
-const STALE_QUEUE_PING_MS = 7500; // Evict ghost queue users after 7.5s without ping
-const CALL_KILL_GRACE_MS = 10000; // 10s grace for Wi-Fi <-> Cellular switch; if app was killed, ends call
-const PROTECTED_AD_GRACE_MS = 25000; // 25s grace when user is picking an image or granting permissions
-const CONNECTING_KILL_GRACE_MS = 8000; // 8s grace during connecting -> InCall screen transition
+const QUEUE_MAX_WAIT_MS = 10000; // Strict 10s max wait in matchmaking queue
+const STALE_QUEUE_PING_MS = 8000; // Evict dead sockets from queue after 8s without ping
+const CALL_KILL_GRACE_MS = 10000; // 10s grace for network handover; if app killed, ends call
+const PROTECTED_AD_GRACE_MS = 25000; // 25s grace when user is picking image or granting permission
+const CONNECTING_KILL_GRACE_MS = 8000; // 8s grace during RandomConnecting -> InCall transition
 
 // ============================================================================
 // 📝 STRUCTURED RENDER LOGGER
@@ -54,7 +54,7 @@ const socketToUser = new Map(); // socket.id -> emailKey
 const userToRoom = new Map(); // emailKey -> roomId
 const userProtectedUntil = new Map(); // emailKey -> timestamp
 const matchingLocks = new Set(); // emailKey
-const queueTimers = new Map(); // emailKey -> Timeout
+const queueTimers = new Map(); // emailKey -> Timeout (10s auto-remove)
 const disconnectGraceTimers = new Map(); // emailKey -> Timeout
 
 const ID_CHARS =
@@ -95,6 +95,46 @@ function removeFromWaitingQueue(emailKey, reason = "removed") {
     });
   }
   matchingLocks.delete(emailKey);
+}
+
+// 🔒 ZOMBIE-SAFE SOCKET BINDER (Prevents killed-app old sockets from dropping new matches!)
+function bindUserSocket(email, socket) {
+  if (!email || !socket) return null;
+  const emailKey = String(email).trim().toLowerCase();
+
+  clearDisconnectGraceTimer(emailKey);
+
+  const prevSocketId = userToSocket.get(emailKey);
+  if (prevSocketId && prevSocketId !== socket.id) {
+    // Unmap the old zombie socket BEFORE disconnecting it so its 'disconnect' listener is a no-op
+    socketToUser.delete(prevSocketId);
+    const oldSock = io.sockets.sockets.get(prevSocketId);
+    if (oldSock) {
+      try {
+        oldSock.disconnect(true);
+      } catch (e) {}
+    }
+  }
+
+  userToSocket.set(emailKey, socket.id);
+  socketToUser.set(socket.id, emailKey);
+
+  // If user is in the waiting queue, update their active socketId
+  const qEntry = waitingQueue.get(emailKey);
+  if (qEntry) {
+    qEntry.socketId = socket.id;
+    qEntry.lastPing = Date.now();
+  }
+
+  // If user has an active room, ensure the new socket is joined to that Socket.IO room
+  const activeRoomId = userToRoom.get(emailKey);
+  if (activeRoomId && activeRooms.has(activeRoomId)) {
+    socket.join(activeRoomId);
+    const room = activeRooms.get(activeRoomId);
+    room.lastHeartbeat = Date.now();
+  }
+
+  return emailKey;
 }
 
 // ============================================================================
@@ -313,23 +353,11 @@ io.on("connection", (socket) => {
   socket.on("register_user", (payload) => {
     if (!payload?.email) return;
     const email = String(payload.email).trim();
-    const emailKey = email.toLowerCase();
-
-    clearDisconnectGraceTimer(emailKey);
-
-    const prevSocketId = userToSocket.get(emailKey);
-    if (prevSocketId && prevSocketId !== socket.id) {
-      socketToUser.delete(prevSocketId);
-    }
-
-    userToSocket.set(emailKey, socket.id);
-    socketToUser.set(socket.id, emailKey);
+    const emailKey = bindUserSocket(email, socket);
 
     const activeRoomId = payload.roomId || userToRoom.get(emailKey);
     if (activeRoomId && activeRooms.has(activeRoomId)) {
       socket.join(activeRoomId);
-      const room = activeRooms.get(activeRoomId);
-      room.lastHeartbeat = Date.now();
     }
 
     logEvent("USER_REGISTERED", `User registered: ${email}`, {
@@ -351,23 +379,21 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 3. JOIN MATCHMAKING QUEUE
+  // 3. JOIN MATCHMAKING QUEUE (Strict 10s Expiry + Anti-Duplicate Room Protection)
   socket.on("queue_join", (payload) => {
     if (!payload?.email) return;
     const myEmail = String(payload.email).trim();
-    const myKey = myEmail.toLowerCase();
+    const myKey = bindUserSocket(myEmail, socket);
     const now = Date.now();
 
-    clearDisconnectGraceTimer(myKey);
-    userToSocket.set(myKey, socket.id);
-    socketToUser.set(socket.id, myKey);
-
+    // 🛡️ CRITICAL FIX: If this user was ALREADY matched into a room within the last 6 seconds,
+    // NEVER destroy that room on a duplicate `queue_join`! Just re-send the match!
     const existingRoomId = userToRoom.get(myKey);
     if (existingRoomId && activeRooms.has(existingRoomId)) {
       const existingRoom = activeRooms.get(existingRoomId);
       const roomAgeMs = now - (existingRoom.createdAtMs || 0);
 
-      if (!payload.forceNewSearch && roomAgeMs < 4500) {
+      if (roomAgeMs < 6000) {
         const myRole =
           String(existingRoom.caller).toLowerCase() === myKey
             ? "caller"
@@ -377,7 +403,7 @@ io.on("connection", (socket) => {
 
         logEvent(
           "QUEUE_JOIN_DEDUP",
-          `Ignored duplicate queue_join for ${myEmail}; re-emitting active match ${existingRoomId}`
+          `Protected active match ${existingRoomId} for ${myEmail} (age: ${roomAgeMs}ms)`
         );
         socket.join(existingRoomId);
         socket.emit("match_established_sync", {
@@ -389,6 +415,7 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // If the room is old (>6s) and the user is starting a new search, clean up the old room
       destroyRoomAndNotifyPartner(existingRoomId, myEmail, "left", false);
     }
 
@@ -437,7 +464,8 @@ io.on("connection", (socket) => {
         continue;
       }
 
-      const candSocket = io.sockets.sockets.get(candidate.socketId);
+      const candSocketId = userToSocket.get(candKey) || candidate.socketId;
+      const candSocket = io.sockets.sockets.get(candSocketId);
       if (
         !candSocket ||
         !candSocket.connected ||
@@ -450,7 +478,7 @@ io.on("connection", (socket) => {
       const check = evaluateCompatibility(myEntry, candidate);
       if (check.compatible) {
         matchingLocks.add(candKey);
-        matchedPartner = candidate;
+        matchedPartner = { ...candidate, socketId: candSocketId };
         removeFromWaitingQueue(candKey, "matched");
         break;
       } else {
@@ -461,6 +489,7 @@ io.on("connection", (socket) => {
       }
     }
 
+    // 🎉 MATCH FOUND: Create 20-Char Room in RAM & Emit to Both Users Simultaneously
     if (matchedPartner) {
       const partnerKey = matchedPartner.email.toLowerCase();
       removeFromWaitingQueue(myKey, "matched");
@@ -541,10 +570,11 @@ io.on("connection", (socket) => {
       return;
     }
 
+    // Place user in waiting queue with strict 10-second auto-removal
     waitingQueue.set(myKey, myEntry);
     matchingLocks.delete(myKey);
 
-    logEvent("QUEUE_WAITING", `⏳ ${myEmail} waiting in queue`, {
+    logEvent("QUEUE_WAITING", `⏳ ${myEmail} waiting in queue (10s max)`, {
       waitingCount: waitingQueue.size,
       waitingUsers: Array.from(waitingQueue.keys()),
     });
@@ -553,8 +583,12 @@ io.on("connection", (socket) => {
     const expiryTimer = setTimeout(() => {
       if (waitingQueue.has(myKey) && !userToRoom.has(myKey)) {
         removeFromWaitingQueue(myKey, "10s_timeout");
-        logEvent("QUEUE_TIMEOUT", `⏰ 10s timeout for ${myEmail}`);
-        socket.emit("queue_expired_10s", {
+        logEvent(
+          "QUEUE_TIMEOUT_10S",
+          `⏰ 10s elapsed — auto-removed ${myEmail} from waitingQueue`
+        );
+        const curSockId = userToSocket.get(myKey) || socket.id;
+        io.to(curSockId).emit("queue_expired_10s", {
           email: myEmail,
           timestamp: Date.now(),
         });
@@ -566,20 +600,11 @@ io.on("connection", (socket) => {
   // 4. 2-SECOND QUEUE PING
   socket.on("queue_ping", (payload) => {
     if (!payload?.email) return;
-    const key = String(payload.email).trim().toLowerCase();
-    clearDisconnectGraceTimer(key);
-    userToSocket.set(key, socket.id);
-    socketToUser.set(socket.id, key);
-
-    const entry = waitingQueue.get(key);
-    if (entry) {
-      entry.lastPing = Date.now();
-      entry.socketId = socket.id;
-    }
+    bindUserSocket(payload.email, socket);
     socket.emit("queue_pong", { timestamp: Date.now() });
   });
 
-  // 5. LEAVE QUEUE / ABORT
+  // 5. LEAVE QUEUE / EXPLICIT ABORT
   socket.on("queue_leave", (payload) => {
     const email = payload?.email || socketToUser.get(socket.id);
     if (!email) return;
@@ -608,10 +633,7 @@ io.on("connection", (socket) => {
   socket.on("entered_incall", (payload) => {
     const { roomId, email, role } = payload || {};
     if (email) {
-      const key = String(email).trim().toLowerCase();
-      clearDisconnectGraceTimer(key);
-      userToSocket.set(key, socket.id);
-      socketToUser.set(socket.id, key);
+      bindUserSocket(email, socket);
     }
     if (roomId && activeRooms.has(roomId)) {
       const room = activeRooms.get(roomId);
@@ -633,11 +655,10 @@ io.on("connection", (socket) => {
     socket.join(roomId);
 
     if (email) {
-      const key = String(email).trim().toLowerCase();
-      clearDisconnectGraceTimer(key);
-      userToSocket.set(key, socket.id);
-      socketToUser.set(socket.id, key);
-      userToRoom.set(key, roomId);
+      const key = bindUserSocket(email, socket);
+      if (key && activeRooms.has(roomId)) {
+        userToRoom.set(key, roomId);
+      }
     }
 
     const room = activeRooms.get(roomId) || null;
@@ -812,15 +833,19 @@ io.on("connection", (socket) => {
   socket.on("videobackground", handleExplicitExit("background"));
   socket.on("checkInternet", handleExplicitExit("disconnected"));
 
+  // 7. ZOMBIE-SAFE SOCKET DISCONNECT HANDLER
   socket.on("disconnect", (disconnectReason) => {
     const emailKey = socketToUser.get(socket.id);
     if (!emailKey) return;
 
     socketToUser.delete(socket.id);
-    if (userToSocket.get(emailKey) === socket.id) {
-      userToSocket.delete(emailKey);
+
+    // 🛡️ CRITICAL: If the user already reconnected on a newer socket, ignore this old socket's disconnect!
+    if (userToSocket.get(emailKey) !== socket.id) {
+      return;
     }
 
+    userToSocket.delete(emailKey);
     removeFromWaitingQueue(emailKey, `socket_disconnect:${disconnectReason}`);
 
     const activeRoomId = userToRoom.get(emailKey);
@@ -861,14 +886,20 @@ io.on("connection", (socket) => {
   });
 });
 
+// Sweep stale queue entries & abandoned rooms every 15s
 setInterval(() => {
   const now = Date.now();
+  for (const [emailKey, entry] of waitingQueue.entries()) {
+    if (now - entry.joinedAt > QUEUE_MAX_WAIT_MS + 1000) {
+      removeFromWaitingQueue(emailKey, "sweeper_10s_expired");
+    }
+  }
   for (const [roomId, room] of activeRooms.entries()) {
     if (now - (room.lastHeartbeat || now) > 120000) {
       destroyRoomAndNotifyPartner(roomId, room.caller, "disconnected", false);
     }
   }
-}, 60000);
+}, 15000);
 
 app.get("/", (req, res) => {
   res.status(200).json({
