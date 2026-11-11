@@ -23,13 +23,22 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 5000;
-const QUEUE_MAX_WAIT_MS = 10000; // Strict 10s max wait in matchmaking queue
-const STALE_QUEUE_PING_MS = 3800; // Auto-evict searching user if pings stop for >3.8s (data expired / net off)
-const CALL_NETWORK_SWITCH_GRACE_MS = 8000; // 8s grace for Wi-Fi <-> Cellular switch during active call
-const PROTECTED_AD_GRACE_MS = 25000; // 25s grace when user opens gallery or Bluetooth permission prompt
 
 // ============================================================================
-// 📝 STRUCTURED RENDER LOGGER
+// ⚙️ LIFECYCLE CONSTANTS (STRICT SEPARATION OF MATCHMAKING VS ACTIVE CALL)
+// ============================================================================
+const SERVER_INSTANCE_ID = `srv_${Date.now()}_${crypto
+  .randomBytes(4)
+  .toString("hex")}`;
+const QUEUE_MAX_WAIT_MS = 10000; // Strict 10.0s maximum matchmaking queue duration
+const QUEUE_HEARTBEAT_EXPIRY_MS = 4000; // Evict waiting user if queue pings stop > 4s
+const TRANSITION_HOLD_MAX_MS = 7500; // Max time allowed in 2s hold before both enter InCall
+const ACTIVE_CALL_DISCONNECT_TIMEOUT_MS = 8000; // Network loss / force-close detection timeout
+const ACTIVE_CALL_HEARTBEAT_LEASE_MS = 25000; // Lease expiry if client stops all heartbeats/packets
+const PROTECTED_DIALOG_GRACE_MS = 25000; // Grace window while picking gallery image or BT permission
+
+// ============================================================================
+// 📝 PRIVACY-SAFE STRUCTURED LOGGER (NEVER LOGS SENSITIVE SDP PAYLOADS)
 // ============================================================================
 function logEvent(category, message, details = null) {
   const ts = new Date().toISOString();
@@ -44,17 +53,19 @@ function logEvent(category, message, details = null) {
 }
 
 // ============================================================================
-// 🗂️ IN-MEMORY STORES (ZERO DATABASE READS / WRITES)
+// 🗂️ TEMPORARY IN-MEMORY STORES ONLY (ZERO DATABASE STORAGE)
 // ============================================================================
 const waitingQueue = new Map(); // emailKey -> queueEntry
 const activeRooms = new Map(); // roomId (20-char) -> roomObject
 const userToSocket = new Map(); // emailKey -> socket.id
 const socketToUser = new Map(); // socket.id -> emailKey
 const userToRoom = new Map(); // emailKey -> roomId
+const userSessionGen = new Map(); // emailKey -> monotonic integer generation counter
+const cancelledAttempts = new Set(); // attemptId (blocks late matches on aborted attempts)
 const userProtectedUntil = new Map(); // emailKey -> timestamp
-const matchingLocks = new Set(); // emailKey (atomic lock preventing >2 user collisions)
-const queueTimers = new Map(); // emailKey -> Timeout (strict 10s timer)
-const disconnectGraceTimers = new Map(); // emailKey -> Timeout
+const matchingLocks = new Set(); // emailKey (atomic 1-to-1 lock)
+const queueTimers = new Map(); // emailKey -> Timeout (10s matchmaking timer)
+const disconnectTimers = new Map(); // emailKey -> Timeout (disconnect/force-close timer)
 
 const ID_CHARS =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -67,6 +78,16 @@ function generateRoomId(length = 20) {
   return activeRooms.has(result) ? generateRoomId(length) : result;
 }
 
+function generateAttemptId() {
+  return `att_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function nextUserGeneration(emailKey) {
+  const nextGen = (userSessionGen.get(emailKey) || 0) + 1;
+  userSessionGen.set(emailKey, nextGen);
+  return nextGen;
+}
+
 function clearQueueTimer(emailKey) {
   const timer = queueTimers.get(emailKey);
   if (timer) {
@@ -75,20 +96,31 @@ function clearQueueTimer(emailKey) {
   }
 }
 
-function clearDisconnectGraceTimer(emailKey) {
-  const timer = disconnectGraceTimers.get(emailKey);
+function clearDisconnectTimer(emailKey) {
+  const timer = disconnectTimers.get(emailKey);
   if (timer) {
     clearTimeout(timer);
-    disconnectGraceTimers.delete(emailKey);
+    disconnectTimers.delete(emailKey);
   }
 }
 
-function removeFromWaitingQueue(emailKey, reason = "removed") {
+// Idempotent Queue Removal: Cancels timers, marks attempt cancelled, and frees memory
+function removeFromWaitingQueue(
+  emailKey,
+  reason = "removed",
+  markAttemptCancelled = true
+) {
   if (!emailKey) return;
   clearQueueTimer(emailKey);
-  if (waitingQueue.has(emailKey)) {
+  const existing = waitingQueue.get(emailKey);
+  if (existing) {
+    if (markAttemptCancelled && existing.attemptId) {
+      cancelledAttempts.add(existing.attemptId);
+      setTimeout(() => cancelledAttempts.delete(existing.attemptId), 30000);
+    }
     waitingQueue.delete(emailKey);
     logEvent("QUEUE_REMOVE", `Removed ${emailKey} from waitingQueue`, {
+      attemptId: existing.attemptId,
       reason,
       remainingInQueue: waitingQueue.size,
     });
@@ -96,12 +128,12 @@ function removeFromWaitingQueue(emailKey, reason = "removed") {
   matchingLocks.delete(emailKey);
 }
 
-// 🔒 ZOMBIE-SAFE SOCKET BINDER
+// Zombie-Safe Socket Binder: Binds user to current socket & updates active room heartbeat
 function bindUserSocket(email, socket) {
   if (!email || !socket) return null;
   const emailKey = String(email).trim().toLowerCase();
 
-  clearDisconnectGraceTimer(emailKey);
+  clearDisconnectTimer(emailKey);
 
   const prevSocketId = userToSocket.get(emailKey);
   if (prevSocketId && prevSocketId !== socket.id) {
@@ -128,9 +160,54 @@ function bindUserSocket(email, socket) {
     socket.join(activeRoomId);
     const room = activeRooms.get(activeRoomId);
     room.lastHeartbeat = Date.now();
+    if (String(room.caller).toLowerCase() === emailKey) {
+      room.callerLastHeartbeat = Date.now();
+    } else if (String(room.callee).toLowerCase() === emailKey) {
+      room.calleeLastHeartbeat = Date.now();
+    }
   }
 
   return emailKey;
+}
+
+// ============================================================================
+// 🛡️ STALE SIGNALING VALIDATOR (SECTION H)
+// Verifies room exists, sender belongs to room, and recipient is still in room
+// ============================================================================
+function validateSignalingParticipant(roomId, socket, explicitEmail = null) {
+  if (!roomId || !activeRooms.has(roomId)) return null;
+  const room = activeRooms.get(roomId);
+  if (!room || room.status !== "active") return null;
+
+  const senderKey = explicitEmail
+    ? String(explicitEmail).trim().toLowerCase()
+    : socketToUser.get(socket.id);
+  if (!senderKey) return null;
+
+  const callerKey = String(room.caller || "").toLowerCase();
+  const calleeKey = String(room.callee || "").toLowerCase();
+
+  if (senderKey !== callerKey && senderKey !== calleeKey) return null;
+  if (userToRoom.get(senderKey) !== roomId) return null;
+
+  const recipientKey = senderKey === callerKey ? calleeKey : callerKey;
+  if (userToRoom.get(recipientKey) !== roomId) return null;
+
+  const now = Date.now();
+  room.lastHeartbeat = now;
+  if (senderKey === callerKey) {
+    room.callerLastHeartbeat = now;
+  } else {
+    room.calleeLastHeartbeat = now;
+  }
+
+  return {
+    room,
+    senderKey,
+    recipientKey,
+    isCaller: senderKey === callerKey,
+    recipientSocketId: userToSocket.get(recipientKey),
+  };
 }
 
 // ============================================================================
@@ -254,22 +331,37 @@ function evaluateCompatibility(userA, userB) {
 }
 
 // ============================================================================
-// 🧹 ROOM TEARDOWN & PARTNER NOTIFICATION HELPER (HANDLES BOTH HOLD & INCALL)
+// 🧹 IDEMPOTENT ROOM TEARDOWN & PARTNER NOTIFICATION (SECTIONS D, E, G)
 // ============================================================================
 function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
   if (!roomId || !activeRooms.has(roomId)) return;
   const room = activeRooms.get(roomId);
+
+  // Mark terminated and delete from activeRooms immediately so no further signaling is forwarded
+  room.status = "terminated";
+  room.offer = null;
+  room.answer = null;
+  room.callerCandidates = [];
+  room.calleeCandidates = [];
+  room.iceRestartOffer = null;
+  room.iceRestartAnswer = null;
   activeRooms.delete(roomId);
 
   const callerKey = String(room.caller || "").toLowerCase();
   const calleeKey = String(room.callee || "").toLowerCase();
   const leaverKey = String(leaverEmail || "").toLowerCase();
 
-  clearDisconnectGraceTimer(callerKey);
-  clearDisconnectGraceTimer(calleeKey);
+  clearDisconnectTimer(callerKey);
+  clearDisconnectTimer(calleeKey);
 
   if (userToRoom.get(callerKey) === roomId) userToRoom.delete(callerKey);
   if (userToRoom.get(calleeKey) === roomId) userToRoom.delete(calleeKey);
+
+  // Leave Socket.IO room channel on both sockets
+  const callerSockId = userToSocket.get(callerKey);
+  const calleeSockId = userToSocket.get(calleeKey);
+  if (callerSockId) io.sockets.sockets.get(callerSockId)?.leave(roomId);
+  if (calleeSockId) io.sockets.sockets.get(calleeSockId)?.leave(roomId);
 
   const partnerKey = leaverKey === callerKey ? calleeKey : callerKey;
   const partnerEmail = leaverKey === callerKey ? room.callee : room.caller;
@@ -279,15 +371,13 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
     (Date.now() - (room.createdAtMs || Date.now())) / 1000
   );
 
-  logEvent("ROOM_DESTROYED", `Room ${roomId} closed`, {
+  logEvent("ROOM_DESTROYED", `Room ${roomId} terminated & wiped from memory`, {
     roomId,
     caller: room.caller,
     callee: room.callee,
-    endedBy: leaverEmail || "unknown",
+    endedBy: leaverEmail || "system",
     reason,
     durationSec: `${durationSec}s`,
-    callerInCall: Boolean(room.callerEnteredInCall),
-    calleeInCall: Boolean(room.calleeEnteredInCall),
     remainingActiveRooms: activeRooms.size,
   });
 
@@ -298,8 +388,7 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
   const isLost =
     cleanReason === "disconnected" || cleanReason.includes("internet");
 
-  // Always emit BOTH connecting-screen and incall-screen drop events so whichever
-  // screen the partner is currently on (2.5s hold OR InCallScreen), they are alerted at 0ms!
+  // Emit both transition-hold and active-call teardown events so partner is alerted regardless of screen
   io.to(partnerSocketId).emit("partner_disconnected_requeue", {
     roomId,
     action: cleanReason,
@@ -328,7 +417,7 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
       ? "User is looking for someone else"
       : isLost
       ? "User has lost the connection"
-      : "The user has left the connection",
+      : "The user has ended the call",
     by: leaverEmail,
     timestamp: Date.now(),
   });
@@ -340,10 +429,39 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
 }
 
 // ============================================================================
-// ⚡ SOCKET.IO CONNECTION & REAL-TIME SIGNALING ENGINE
+// ⚡ SOCKET.IO CONNECTION & REAL-TIME LIFECYCLE ENGINE
 // ============================================================================
 io.on("connection", (socket) => {
   logEvent("SOCKET_CONNECTED", `New socket connected: ${socket.id}`);
+
+  // Send server instance ID immediately so client detects server restarts (Section F)
+  socket.emit("server_hello", {
+    serverInstanceId: SERVER_INSTANCE_ID,
+    timestamp: Date.now(),
+  });
+
+  // Update room heartbeat automatically whenever any packet arrives from this socket
+  socket.conn.on("packet", () => {
+    const emailKey = socketToUser.get(socket.id);
+    if (!emailKey) return;
+    const now = Date.now();
+
+    const qEntry = waitingQueue.get(emailKey);
+    if (qEntry) {
+      qEntry.lastPing = now;
+    }
+
+    const rId = userToRoom.get(emailKey);
+    if (rId && activeRooms.has(rId)) {
+      const room = activeRooms.get(rId);
+      room.lastHeartbeat = now;
+      if (String(room.caller).toLowerCase() === emailKey) {
+        room.callerLastHeartbeat = now;
+      } else {
+        room.calleeLastHeartbeat = now;
+      }
+    }
+  });
 
   // 1. REGISTER USER
   socket.on("register_user", (payload) => {
@@ -351,44 +469,54 @@ io.on("connection", (socket) => {
     const email = String(payload.email).trim();
     const emailKey = bindUserSocket(email, socket);
 
-    const activeRoomId = payload.roomId || userToRoom.get(emailKey);
-    if (activeRoomId && activeRooms.has(activeRoomId)) {
-      socket.join(activeRoomId);
+    // Section F: If client thinks it is in a room that no longer exists (e.g. after server restart), tell client immediately
+    if (payload.roomId && !activeRooms.has(payload.roomId)) {
+      socket.emit("room_ended", {
+        roomId: payload.roomId,
+        status: "server_restarted",
+        endedReason: "disconnected",
+        timestamp: Date.now(),
+      });
     }
 
     logEvent("USER_REGISTERED", `User registered: ${email}`, {
       socketId: socket.id,
       screen: payload.screen || "unknown",
-      activeRoomId: activeRoomId || null,
+      activeRoomId: userToRoom.get(emailKey) || null,
     });
   });
 
-  // 2. GALLERY / BLUETOOTH PERMISSION PROTECTION FLAG
+  // 2. GALLERY / PERMISSION DIALOG PROTECTION FLAG
   socket.on("ad_status", (payload) => {
     const email = payload?.email || socketToUser.get(socket.id);
     if (!email) return;
     const key = String(email).toLowerCase();
     if (payload?.isActive) {
-      userProtectedUntil.set(key, Date.now() + PROTECTED_AD_GRACE_MS);
+      userProtectedUntil.set(key, Date.now() + PROTECTED_DIALOG_GRACE_MS);
     } else {
       userProtectedUntil.delete(key);
     }
   });
 
-  // 3. JOIN MATCHMAKING QUEUE (Strict 1-to-1 Atomic Match + 10s Auto-Remove)
+  // 3. JOIN MATCHMAKING QUEUE (Strict 10s Timeout, Unique Attempt ID, Atomic 1-to-1 Pairing)
   socket.on("queue_join", (payload) => {
     if (!payload?.email) return;
     const myEmail = String(payload.email).trim();
     const myKey = bindUserSocket(myEmail, socket);
     const now = Date.now();
+    const incomingAttemptId = payload.attemptId || generateAttemptId();
 
-    // Protect active match if duplicate queue_join arrives within 5 seconds of matching
+    if (cancelledAttempts.has(incomingAttemptId)) {
+      return;
+    }
+
+    // Protect newly created match if a duplicate socket packet arrives within 4s
     const existingRoomId = userToRoom.get(myKey);
     if (existingRoomId && activeRooms.has(existingRoomId)) {
       const existingRoom = activeRooms.get(existingRoomId);
       const roomAgeMs = now - (existingRoom.createdAtMs || 0);
 
-      if (!payload.forceNewSearch && roomAgeMs < 5000) {
+      if (!payload.forceNewSearch && roomAgeMs < 4000) {
         const myRole =
           String(existingRoom.caller).toLowerCase() === myKey
             ? "caller"
@@ -401,6 +529,7 @@ io.on("connection", (socket) => {
         socket.join(existingRoomId);
         socket.emit("match_established_sync", {
           roomId: existingRoomId,
+          attemptId: incomingAttemptId,
           role: myRole,
           partnerEmail: partnerProfile.email,
           partnerGender: partnerProfile.gender,
@@ -410,17 +539,23 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // If starting a manual retry/new search, clean up any old room first
+      // If starting a fresh search (e.g., after NEXT or RETRY), terminate previous room first
       destroyRoomAndNotifyPartner(existingRoomId, myEmail, "left");
     }
 
     if (matchingLocks.has(myKey)) return;
     matchingLocks.add(myKey);
 
+    // Remove any previous queue entry for this user before registering the new attempt
+    removeFromWaitingQueue(myKey, "new_attempt_started", false);
+    const mySessionGen = nextUserGeneration(myKey);
+
     const myCountry = String(payload.location || "INDIA")
       .trim()
       .toUpperCase();
     const myEntry = {
+      attemptId: incomingAttemptId,
+      sessionGen: mySessionGen,
       socketId: socket.id,
       email: myEmail,
       uid: payload.uid || null,
@@ -447,7 +582,8 @@ io.on("connection", (socket) => {
     };
 
     logEvent("QUEUE_JOIN", `🔍 User searching: ${myEmail}`, {
-      name: myEntry.name,
+      attemptId: myEntry.attemptId,
+      sessionGen: mySessionGen,
       gender: myEntry.gender,
       age: myEntry.age,
       location: myEntry.location,
@@ -457,34 +593,35 @@ io.on("connection", (socket) => {
 
     let matchedPartner = null;
 
-    // Scan waitingQueue for exactly ONE compatible partner
+    // Scan waitingQueue for a compatible partner (Atomic 1-to-1 Lock)
     for (const [candKey, candidate] of waitingQueue.entries()) {
       if (candKey === myKey) continue;
       if (matchingLocks.has(candKey)) continue;
       if (userToRoom.has(candKey)) {
-        removeFromWaitingQueue(candKey, "already_in_room");
+        removeFromWaitingQueue(candKey, "already_in_room", false);
         continue;
       }
 
       const candSocketId = userToSocket.get(candKey) || candidate.socketId;
       const candSocket = io.sockets.sockets.get(candSocketId);
 
-      // Evict candidate immediately if their socket disconnected, ping expired, or 10s elapsed
       if (
         !candSocket ||
         !candSocket.connected ||
-        now - candidate.lastPing > STALE_QUEUE_PING_MS ||
+        cancelledAttempts.has(candidate.attemptId) ||
+        userSessionGen.get(candKey) !== candidate.sessionGen ||
+        now - candidate.lastPing > QUEUE_HEARTBEAT_EXPIRY_MS ||
         now - candidate.joinedAt >= QUEUE_MAX_WAIT_MS
       ) {
-        removeFromWaitingQueue(candKey, "stale_or_expired_candidate");
+        removeFromWaitingQueue(candKey, "stale_or_expired_candidate", true);
         continue;
       }
 
       const check = evaluateCompatibility(myEntry, candidate);
       if (check.compatible) {
-        // 🔒 ATOMIC 1-TO-1 LOCK: Lock & remove candidate from queue immediately so no 3rd user can touch them
+        // Lock & remove candidate synchronously so no 3rd user can ever match with them
         matchingLocks.add(candKey);
-        removeFromWaitingQueue(candKey, "matched_1_to_1");
+        removeFromWaitingQueue(candKey, "matched_1_to_1", false);
         matchedPartner = { ...candidate, socketId: candSocketId };
         break;
       } else {
@@ -495,11 +632,27 @@ io.on("connection", (socket) => {
       }
     }
 
-    // 🎉 1-TO-1 MATCH FOUND: Create 20-Char Room in RAM & Emit to Both Users Simultaneously
+    // 🎉 1-TO-1 MATCH ESTABLISHED: Cancel Both Queue Timers & Create Room in Memory
     if (matchedPartner) {
       const partnerKey = matchedPartner.email.toLowerCase();
-      removeFromWaitingQueue(myKey, "matched_1_to_1");
-      removeFromWaitingQueue(partnerKey, "matched_1_to_1");
+      removeFromWaitingQueue(myKey, "matched_1_to_1", false);
+      removeFromWaitingQueue(partnerKey, "matched_1_to_1", false);
+
+      // Verify neither user aborted or disconnected during the microsecond of matching
+      const mySock = io.sockets.sockets.get(socket.id);
+      const partnerSock = io.sockets.sockets.get(matchedPartner.socketId);
+      if (
+        !mySock ||
+        !mySock.connected ||
+        !partnerSock ||
+        !partnerSock.connected ||
+        cancelledAttempts.has(incomingAttemptId) ||
+        cancelledAttempts.has(matchedPartner.attemptId)
+      ) {
+        matchingLocks.delete(myKey);
+        matchingLocks.delete(partnerKey);
+        return;
+      }
 
       const roomId = generateRoomId(20);
       const waitTimeMs = now - matchedPartner.joinedAt;
@@ -528,6 +681,8 @@ io.on("connection", (socket) => {
         roomId,
         caller: matchedPartner.email,
         callee: myEntry.email,
+        callerAttemptId: matchedPartner.attemptId,
+        calleeAttemptId: myEntry.attemptId,
         callerUid: matchedPartner.uid || null,
         calleeUid: myEntry.uid || null,
         callerName: callerProfile.name,
@@ -559,6 +714,8 @@ io.on("connection", (socket) => {
         iceRestartRequest: null,
         lastGift: null,
         lastHeartbeat: now,
+        callerLastHeartbeat: now,
+        calleeLastHeartbeat: now,
         createdAt: new Date(now).toISOString(),
         createdAtMs: now,
         callerEnteredInCall: false,
@@ -571,24 +728,25 @@ io.on("connection", (socket) => {
       userToRoom.set(partnerKey, roomId);
       userToRoom.set(myKey, roomId);
 
-      const callerSocket = io.sockets.sockets.get(matchedPartner.socketId);
-      if (callerSocket) callerSocket.join(roomId);
-      socket.join(roomId);
+      partnerSock.join(roomId);
+      mySock.join(roomId);
 
       logEvent(
         "MATCH_ESTABLISHED",
         `🎉 1-TO-1 MATCH: ${matchedPartner.email} (Caller) <-> ${myEntry.email} (Callee)`,
         {
           roomId,
+          callerAttemptId: matchedPartner.attemptId,
+          calleeAttemptId: myEntry.attemptId,
           partnerWaitTimeMs: `${waitTimeMs}ms`,
           activeRoomsTotal: activeRooms.size,
           remainingQueueSize: waitingQueue.size,
         }
       );
 
-      // Emit to Caller with full Callee profile
       io.to(matchedPartner.socketId).emit("match_established_sync", {
         roomId,
+        attemptId: matchedPartner.attemptId,
         role: "caller",
         partnerEmail: calleeProfile.email,
         partnerGender: calleeProfile.gender,
@@ -596,9 +754,9 @@ io.on("connection", (socket) => {
         roomData: roomObject,
       });
 
-      // Emit to Callee with full Caller profile
       io.to(myEntry.socketId).emit("match_established_sync", {
         roomId,
+        attemptId: myEntry.attemptId,
         role: "callee",
         partnerEmail: callerProfile.email,
         partnerGender: callerProfile.gender,
@@ -611,57 +769,92 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // No match yet -> Place user in waitingQueue with strict 10-second auto-removal
+    // No match yet -> Register in waitingQueue with strict 10-second server timeout
     waitingQueue.set(myKey, myEntry);
     matchingLocks.delete(myKey);
 
-    logEvent("QUEUE_WAITING", `⏳ ${myEmail} added to waitingQueue (10s max)`, {
+    logEvent("QUEUE_WAITING", `⏳ ${myEmail} waiting in queue (10s max)`, {
+      attemptId: myEntry.attemptId,
       waitingCount: waitingQueue.size,
-      waitingUsers: Array.from(waitingQueue.keys()),
     });
 
     clearQueueTimer(myKey);
     const expiryTimer = setTimeout(() => {
-      if (waitingQueue.has(myKey) && !userToRoom.has(myKey)) {
-        removeFromWaitingQueue(myKey, "10s_timeout");
-        logEvent(
-          "QUEUE_TIMEOUT_10S",
-          `⏰ 10s elapsed — auto-removed ${myEmail} from waitingQueue`
-        );
-        const curSockId = userToSocket.get(myKey) || socket.id;
-        io.to(curSockId).emit("queue_expired_10s", {
-          email: myEmail,
-          timestamp: Date.now(),
-        });
+      const currentEntry = waitingQueue.get(myKey);
+      // Session & attempt validation: ignore if already matched or on a newer attempt
+      if (
+        !currentEntry ||
+        currentEntry.attemptId !== incomingAttemptId ||
+        currentEntry.sessionGen !== mySessionGen ||
+        userToRoom.has(myKey)
+      ) {
+        return;
       }
+
+      removeFromWaitingQueue(myKey, "10s_server_timeout", true);
+      logEvent(
+        "QUEUE_TIMEOUT_10S",
+        `⏰ 10s elapsed — auto-removed ${myEmail} from waitingQueue`,
+        { attemptId: incomingAttemptId }
+      );
+
+      const curSockId = userToSocket.get(myKey) || socket.id;
+      io.to(curSockId).emit("queue_expired_10s", {
+        email: myEmail,
+        attemptId: incomingAttemptId,
+        timestamp: Date.now(),
+      });
     }, QUEUE_MAX_WAIT_MS);
+
     queueTimers.set(myKey, expiryTimer);
   });
 
-  // 4. 2-SECOND QUEUE & HOLD PING
+  // 4. QUEUE & TRANSITION HOLD HEARTBEAT PING
   socket.on("queue_ping", (payload) => {
     if (!payload?.email) return;
-    const key = bindUserSocket(payload.email, socket);
+    const emailKey = bindUserSocket(payload.email, socket);
+    const now = Date.now();
+
+    const qEntry = waitingQueue.get(emailKey);
+    if (qEntry) {
+      qEntry.lastPing = now;
+    }
+
     if (payload.roomId && activeRooms.has(payload.roomId)) {
       const room = activeRooms.get(payload.roomId);
-      room.lastHeartbeat = Date.now();
+      room.lastHeartbeat = now;
+      if (String(room.caller).toLowerCase() === emailKey) {
+        room.callerLastHeartbeat = now;
+      } else {
+        room.calleeLastHeartbeat = now;
+      }
     }
-    socket.emit("queue_pong", { timestamp: Date.now() });
+
+    socket.emit("queue_pong", {
+      attemptId: payload.attemptId || null,
+      timestamp: now,
+    });
   });
 
-  // 5. LEAVE QUEUE / ABORT DURING 2.5s HOLD
+  // 5. IMMEDIATE QUEUE REMOVAL / ABORT (SECTION C)
   socket.on("queue_leave", (payload) => {
     const email = payload?.email || socketToUser.get(socket.id);
     if (!email) return;
     const key = String(email).trim().toLowerCase();
-    removeFromWaitingQueue(key, payload?.reason || "queue_leave");
+
+    if (payload?.attemptId) {
+      cancelledAttempts.add(payload.attemptId);
+    }
+
+    nextUserGeneration(key);
+    removeFromWaitingQueue(key, payload?.reason || "queue_leave", true);
 
     if (payload?.explicitAbort === true) {
       const roomId = payload.roomId || userToRoom.get(key);
       if (roomId) {
         logEvent(
           "ABORT_DURING_HOLD",
-          `🛑 ${email} aborted/left room ${roomId} (${payload.reason})`
+          `🛑 ${email} explicitly aborted room ${roomId} (${payload.reason})`
         );
         destroyRoomAndNotifyPartner(
           roomId,
@@ -672,13 +865,15 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 6. ENTERED INCALL SCREEN AFTER 2.5s HOLD
+  // 6. ENTERED INCALL SCREEN (CANCELS ALL MATCHMAKING TIMERS — SECTION A.6)
   socket.on("entered_incall", (payload) => {
     const { roomId, email, role } = payload || {};
     const key = email ? bindUserSocket(email, socket) : null;
+    if (key) {
+      removeFromWaitingQueue(key, "entered_incall", false);
+    }
 
     if (!roomId || !activeRooms.has(roomId)) {
-      // Room was already destroyed because partner left during the 2.5s hold!
       socket.emit("room_ended", {
         roomId,
         status: "left",
@@ -688,15 +883,21 @@ io.on("connection", (socket) => {
     }
 
     const room = activeRooms.get(roomId);
-    if (String(role).toLowerCase() === "caller" || key === String(room.caller).toLowerCase()) {
+    const now = Date.now();
+    if (
+      String(role).toLowerCase() === "caller" ||
+      key === String(room.caller).toLowerCase()
+    ) {
       room.callerEnteredInCall = true;
+      room.callerLastHeartbeat = now;
     } else {
       room.calleeEnteredInCall = true;
+      room.calleeLastHeartbeat = now;
     }
     room.enteredInCall = Boolean(
       room.callerEnteredInCall && room.calleeEnteredInCall
     );
-    room.lastHeartbeat = Date.now();
+    room.lastHeartbeat = now;
     socket.join(roomId);
 
     logEvent("ENTERED_INCALL", `🚀 ${email} (${role}) entered InCallScreen`, {
@@ -706,14 +907,14 @@ io.on("connection", (socket) => {
   });
 
   // ==========================================================================
-  // 🎥 INCALL WEBRTC SIGNALING & STATE SYNC (STRICT 2-USER GUARD)
+  // 🎥 INCALL WEBRTC SIGNALING & STATE SYNC (WITH STALE SIGNALING PROTECTION)
   // ==========================================================================
   socket.on("join_room", (payload, callback) => {
     const { roomId, email } = payload || {};
     if (!roomId) return;
 
     const room = activeRooms.get(roomId) || null;
-    if (!room) {
+    if (!room || room.status !== "active") {
       if (typeof callback === "function") {
         callback({ exists: false, room: null });
       }
@@ -725,7 +926,7 @@ io.on("connection", (socket) => {
     const callerKey = String(room.caller || "").toLowerCase();
     const calleeKey = String(room.callee || "").toLowerCase();
 
-    // Strict 1-to-1 Room Guard: Only the paired Caller and Callee may join this room
+    // Section H: Reject if user does not belong to this active room
     if (emailKey && emailKey !== callerKey && emailKey !== calleeKey) {
       if (typeof callback === "function") {
         callback({ exists: false, room: null });
@@ -733,16 +934,24 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const now = Date.now();
     socket.join(roomId);
     if (emailKey) {
+      removeFromWaitingQueue(emailKey, "joined_active_room", false);
       userToRoom.set(emailKey, roomId);
-      if (emailKey === callerKey) room.callerEnteredInCall = true;
-      if (emailKey === calleeKey) room.calleeEnteredInCall = true;
+      if (emailKey === callerKey) {
+        room.callerEnteredInCall = true;
+        room.callerLastHeartbeat = now;
+      }
+      if (emailKey === calleeKey) {
+        room.calleeEnteredInCall = true;
+        room.calleeLastHeartbeat = now;
+      }
       room.enteredInCall = Boolean(
         room.callerEnteredInCall && room.calleeEnteredInCall
       );
     }
-    room.lastHeartbeat = Date.now();
+    room.lastHeartbeat = now;
 
     if (typeof callback === "function") {
       callback({ exists: true, room });
@@ -750,7 +959,7 @@ io.on("connection", (socket) => {
 
     socket.emit("room_snapshot", room);
 
-    // Instant 0ms Replay of Buffered Offer / Answer / ICE Candidates
+    // Replay buffered WebRTC signaling for instant connection
     if (emailKey === calleeKey && room.offer) {
       socket.emit("webrtc_offer", { roomId, offer: room.offer });
     }
@@ -779,9 +988,16 @@ io.on("connection", (socket) => {
 
   socket.on("room_update", (payload) => {
     const { roomId, updates } = payload || {};
-    if (!roomId || !updates || !activeRooms.has(roomId)) return;
+    if (!roomId || !updates) return;
 
-    const room = activeRooms.get(roomId);
+    const valid = validateSignalingParticipant(
+      roomId,
+      socket,
+      updates?.endedBy
+    );
+    if (!valid) return;
+
+    const { room } = valid;
     Object.assign(room, updates, { lastHeartbeat: Date.now() });
     activeRooms.set(roomId, room);
 
@@ -795,7 +1011,7 @@ io.on("connection", (socket) => {
     ) {
       destroyRoomAndNotifyPartner(
         roomId,
-        updates.endedBy || socketToUser.get(socket.id),
+        updates.endedBy || valid.senderKey,
         updates.status
       );
     }
@@ -803,91 +1019,117 @@ io.on("connection", (socket) => {
 
   socket.on("webrtc_offer", (payload) => {
     const { roomId, offer } = payload || {};
-    if (!roomId || !offer || !activeRooms.has(roomId)) return;
-    socket.to(roomId).emit("webrtc_offer", { roomId, offer });
+    if (!roomId || !offer) return;
 
-    const room = activeRooms.get(roomId);
-    room.offer = offer;
-    room.lastHeartbeat = Date.now();
-    logEvent("WEBRTC_OFFER", `📡 Offer relayed in room ${roomId}`);
+    const valid = validateSignalingParticipant(roomId, socket);
+    if (!valid) return;
+
+    valid.room.offer = offer;
+    if (valid.recipientSocketId) {
+      io.to(valid.recipientSocketId).emit("webrtc_offer", { roomId, offer });
+    }
+    logEvent("WEBRTC_OFFER", `📡 Offer forwarded in room ${roomId}`);
   });
 
   socket.on("webrtc_answer", (payload) => {
     const { roomId, answer } = payload || {};
-    if (!roomId || !answer || !activeRooms.has(roomId)) return;
-    socket.to(roomId).emit("webrtc_answer", { roomId, answer });
+    if (!roomId || !answer) return;
 
-    const room = activeRooms.get(roomId);
-    room.answer = answer;
-    room.lastHeartbeat = Date.now();
+    const valid = validateSignalingParticipant(roomId, socket);
+    if (!valid) return;
+
+    valid.room.answer = answer;
+    if (valid.recipientSocketId) {
+      io.to(valid.recipientSocketId).emit("webrtc_answer", { roomId, answer });
+    }
     logEvent(
       "WEBRTC_ANSWER",
-      `✅ Answer relayed in room ${roomId} — Call P2P Connected!`
+      `✅ Answer forwarded in room ${roomId} — P2P Handshake Complete`
     );
   });
 
   socket.on("webrtc_ice_candidate", (payload) => {
     const { roomId, role, candidate } = payload || {};
-    if (!roomId || !candidate || !activeRooms.has(roomId)) return;
-    socket.to(roomId).emit("webrtc_ice_candidate", {
-      roomId,
-      role,
-      candidate,
-    });
+    if (!roomId || !candidate) return;
 
-    const room = activeRooms.get(roomId);
-    if (String(role).toLowerCase() === "caller") {
-      room.callerCandidates.push(candidate);
+    const valid = validateSignalingParticipant(roomId, socket);
+    if (!valid) return;
+
+    if (valid.isCaller) {
+      valid.room.callerCandidates.push(candidate);
     } else {
-      room.calleeCandidates.push(candidate);
+      valid.room.calleeCandidates.push(candidate);
     }
-    room.lastHeartbeat = Date.now();
+
+    if (valid.recipientSocketId) {
+      io.to(valid.recipientSocketId).emit("webrtc_ice_candidate", {
+        roomId,
+        role: valid.isCaller ? "caller" : "callee",
+        candidate,
+      });
+    }
   });
 
   socket.on("webrtc_ice_restart", (payload) => {
     const { roomId, iceRestartRequest, iceRestartOffer, iceRestartAnswer } =
       payload || {};
-    if (!roomId || !activeRooms.has(roomId)) return;
-    socket.to(roomId).emit("webrtc_ice_restart", payload);
+    if (!roomId) return;
 
-    const room = activeRooms.get(roomId);
+    const valid = validateSignalingParticipant(roomId, socket);
+    if (!valid) return;
+
     if (iceRestartRequest !== undefined)
-      room.iceRestartRequest = iceRestartRequest;
-    if (iceRestartOffer !== undefined) room.iceRestartOffer = iceRestartOffer;
+      valid.room.iceRestartRequest = iceRestartRequest;
+    if (iceRestartOffer !== undefined)
+      valid.room.iceRestartOffer = iceRestartOffer;
     if (iceRestartAnswer !== undefined)
-      room.iceRestartAnswer = iceRestartAnswer;
-    room.lastHeartbeat = Date.now();
+      valid.room.iceRestartAnswer = iceRestartAnswer;
+
+    if (valid.recipientSocketId) {
+      io.to(valid.recipientSocketId).emit("webrtc_ice_restart", payload);
+    }
   });
 
   socket.on("room_heartbeat", (payload) => {
-    const { roomId } = payload || {};
-    if (!roomId || !activeRooms.has(roomId)) return;
-    const room = activeRooms.get(roomId);
-    room.lastHeartbeat = Date.now();
+    const { roomId, email } = payload || {};
+    if (!roomId) return;
+    if (!activeRooms.has(roomId)) {
+      socket.emit("room_ended", {
+        roomId,
+        status: "disconnected",
+        endedReason: "disconnected",
+      });
+      return;
+    }
+    validateSignalingParticipant(roomId, socket, email);
   });
 
-  // Explicit Exit Events (End, Next, Background, Internet Lost) -> 0ms Teardown
+  // 7. EXPLICIT CALL & QUEUE TERMINATION EVENTS (END, NEXT, BACKGROUND, INTERNET LOST)
   const handleExplicitExit = (defaultReason) => (payload) => {
     const email =
       (typeof payload === "object" && payload?.email) ||
       socketToUser.get(socket.id);
-    const emailKey = email ? String(email).toLowerCase() : null;
-    if (emailKey) removeFromWaitingQueue(emailKey, defaultReason);
+    const emailKey = email ? String(email).trim().toLowerCase() : null;
+
+    if (emailKey) {
+      nextUserGeneration(emailKey);
+      removeFromWaitingQueue(emailKey, defaultReason, true);
+    }
 
     const roomId =
       typeof payload === "string"
         ? payload
         : payload?.roomId || (emailKey ? userToRoom.get(emailKey) : null);
 
-    if (roomId) {
+    if (roomId && activeRooms.has(roomId)) {
       const reason =
         (typeof payload === "object" && (payload?.reason || payload?.status)) ||
         defaultReason;
       logEvent(
         "EXPLICIT_EXIT",
-        `🚪 ${email || socket.id} exited room ${roomId} (${reason})`
+        `🚪 ${email || socket.id} terminated room ${roomId} (${reason})`
       );
-      destroyRoomAndNotifyPartner(roomId, email, reason);
+      destroyRoomAndNotifyPartner(roomId, email || emailKey, reason);
     }
   };
 
@@ -897,7 +1139,7 @@ io.on("connection", (socket) => {
   socket.on("videobackground", handleExplicitExit("background"));
   socket.on("checkInternet", handleExplicitExit("disconnected"));
 
-  // 7. SOCKET DISCONNECT (0ms Queue Removal + Instant Hold Drop Detection)
+  // 8. SOCKET DISCONNECT (FORCE-CLOSE & NETWORK LOSS DETECTION — SECTIONS C & D.4/D.5)
   socket.on("disconnect", (disconnectReason) => {
     const emailKey = socketToUser.get(socket.id);
     if (!emailKey) return;
@@ -906,29 +1148,29 @@ io.on("connection", (socket) => {
     if (userToSocket.get(emailKey) !== socket.id) {
       return;
     }
-
     userToSocket.delete(emailKey);
 
-    // 1. Always remove from waitingQueue at 0ms when socket disconnects
-    removeFromWaitingQueue(emailKey, `socket_disconnect:${disconnectReason}`);
+    // 1. If waiting in matchmaking queue -> remove immediately at 0ms
+    removeFromWaitingQueue(emailKey, `socket_disconnect:${disconnectReason}`, true);
 
+    // 2. If in a room -> start disconnect detection timer
     const activeRoomId = userToRoom.get(emailKey);
     if (!activeRoomId || !activeRooms.has(activeRoomId)) return;
 
     const room = activeRooms.get(activeRoomId);
     const isProtected = (userProtectedUntil.get(emailKey) || 0) > Date.now();
 
-    // 2. If user disconnected during the 2.5s RandomConnectingScreen hold (before entering InCall),
-    // destroy the room immediately (400ms) so the partner is NOT pushed into an empty InCallScreen!
+    // If partner disconnected during the 2s match-found transition hold, terminate within 350ms
+    // so the other user is never pushed into an empty InCallScreen!
     const graceMs = isProtected
-      ? PROTECTED_AD_GRACE_MS
+      ? PROTECTED_DIALOG_GRACE_MS
       : room.enteredInCall
-      ? CALL_NETWORK_SWITCH_GRACE_MS
-      : 400;
+      ? ACTIVE_CALL_DISCONNECT_TIMEOUT_MS
+      : 350;
 
-    clearDisconnectGraceTimer(emailKey);
+    clearDisconnectTimer(emailKey);
     const timer = setTimeout(() => {
-      disconnectGraceTimers.delete(emailKey);
+      disconnectTimers.delete(emailKey);
       const currentSocketId = userToSocket.get(emailKey);
       const currentSocket = currentSocketId
         ? io.sockets.sockets.get(currentSocketId)
@@ -936,55 +1178,85 @@ io.on("connection", (socket) => {
 
       if (!currentSocket || !currentSocket.connected) {
         logEvent(
-          "DISCONNECT_ROOM_CLOSE",
-          `💀 ${emailKey} disconnected (${disconnectReason}). Closing room ${activeRoomId}`
+          "DISCONNECT_TERMINATED",
+          `💀 ${emailKey} did not reconnect within ${graceMs}ms (${disconnectReason}). Terminating room ${activeRoomId}`
         );
         destroyRoomAndNotifyPartner(activeRoomId, emailKey, "disconnected");
       }
     }, graceMs);
 
-    disconnectGraceTimers.set(emailKey, timer);
+    disconnectTimers.set(emailKey, timer);
   });
 });
 
 // ============================================================================
-// ⏱️ 1-SECOND REAL-TIME QUEUE & ROOM HEALTH SWEEPER
-// Automatically removes users from waitingQueue if 10s expires or data/net drops
+// ⏱️ 1-SECOND REAL-TIME QUEUE & HEARTBEAT LEASE SWEEPER
+// - Enforces 10s matchmaking timeout & 4s queue heartbeat lease
+// - Enforces active-call heartbeat lease WITHOUT any maximum call duration limit!
 // ============================================================================
 setInterval(() => {
   const now = Date.now();
+
+  // 1. Sweep waitingQueue for expired (>10s) or dead-heartbeat (>4s) entries
   for (const [emailKey, entry] of waitingQueue.entries()) {
     const sock = io.sockets.sockets.get(entry.socketId);
     const isSocketDead = !sock || !sock.connected;
-    const isPingExpired = now - entry.lastPing > STALE_QUEUE_PING_MS;
+    const isPingExpired = now - entry.lastPing > QUEUE_HEARTBEAT_EXPIRY_MS;
     const isTimeExpired = now - entry.joinedAt >= QUEUE_MAX_WAIT_MS;
 
     if (isSocketDead || isPingExpired || isTimeExpired) {
       const reason = isSocketDead
         ? "socket_dead"
         : isPingExpired
-        ? "data_or_network_lost"
+        ? "heartbeat_expired"
         : "10s_timeout";
-      removeFromWaitingQueue(emailKey, reason);
+      const expiredAttemptId = entry.attemptId;
+      removeFromWaitingQueue(emailKey, reason, true);
+
       if (isTimeExpired && sock && sock.connected) {
         sock.emit("queue_expired_10s", {
           email: entry.email,
+          attemptId: expiredAttemptId,
           timestamp: now,
         });
       }
     }
   }
 
-  // Clean up any room where one user never entered InCall within 6s of matching
+  // 2. Sweep activeRooms ONLY for transition-hold abandonment or dead-heartbeat lease
+  // (Active calls have UNLIMITED duration as long as heartbeats/packets arrive!)
   for (const [roomId, room] of activeRooms.entries()) {
-    if (!room.enteredInCall && now - room.createdAtMs > 6500) {
+    if (!room.enteredInCall && now - room.createdAtMs > TRANSITION_HOLD_MAX_MS) {
       logEvent(
-        "HOLD_TIMEOUT_CLEANUP",
-        `Closing room ${roomId} because one user did not enter InCall`
+        "HOLD_ABANDONED",
+        `Closing room ${roomId} because transition hold exceeded ${TRANSITION_HOLD_MAX_MS}ms`
       );
       destroyRoomAndNotifyPartner(roomId, room.caller, "left");
-    } else if (now - (room.lastHeartbeat || now) > 90000) {
-      destroyRoomAndNotifyPartner(roomId, room.caller, "disconnected");
+      continue;
+    }
+
+    const callerKey = String(room.caller || "").toLowerCase();
+    const calleeKey = String(room.callee || "").toLowerCase();
+    const callerProtected = (userProtectedUntil.get(callerKey) || 0) > now;
+    const calleeProtected = (userProtectedUntil.get(calleeKey) || 0) > now;
+
+    if (!callerProtected && !calleeProtected) {
+      const callerSilentMs = now - (room.callerLastHeartbeat || room.createdAtMs);
+      const calleeSilentMs = now - (room.calleeLastHeartbeat || room.createdAtMs);
+
+      if (callerSilentMs > ACTIVE_CALL_HEARTBEAT_LEASE_MS) {
+        logEvent(
+          "HEARTBEAT_LEASE_EXPIRED",
+          `Caller ${room.caller} heartbeat expired (${callerSilentMs}ms). Closing room ${roomId}`
+        );
+        destroyRoomAndNotifyPartner(roomId, room.caller, "disconnected");
+      } else if (calleeSilentMs > ACTIVE_CALL_HEARTBEAT_LEASE_MS) {
+        logEvent(
+          "HEARTBEAT_LEASE_EXPIRED",
+          `Callee ${room.callee} heartbeat expired (${calleeSilentMs}ms). Closing room ${roomId}`
+        );
+        destroyRoomAndNotifyPartner(roomId, room.callee, "disconnected");
+      }
     }
   }
 }, 1000);
@@ -992,11 +1264,10 @@ setInterval(() => {
 app.get("/", (req, res) => {
   res.status(200).json({
     server: "VideoConnectServer",
+    serverInstanceId: SERVER_INSTANCE_ID,
     status: "online",
     waitingInQueue: waitingQueue.size,
-    waitingUsers: Array.from(waitingQueue.keys()),
     activeRoomsCount: activeRooms.size,
-    activeRoomIds: Array.from(activeRooms.keys()),
     uptimeSeconds: Math.floor(process.uptime()),
   });
 });
@@ -1008,6 +1279,6 @@ app.get("/health", (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   logEvent(
     "SERVER_START",
-    `🚀 VideoConnectServer running on 0.0.0.0:${PORT}`
+    `🚀 VideoConnectServer (${SERVER_INSTANCE_ID}) running on 0.0.0.0:${PORT}`
   );
 });
